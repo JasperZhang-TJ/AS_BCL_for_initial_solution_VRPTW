@@ -19,11 +19,12 @@ class BCL_cluster:
         self.delta_L = 1
         self.forgetting_factor = 1/len(self.customers)
         self.learn_alpha = 0.02
-        self.d_0 = 20
 
         # 提取经度和纬度
         latitudes = [v[0] for v in self.cus_data.values()]
         longitudes = [v[1] for v in self.cus_data.values()]
+
+        self.d_0 = max(max(latitudes)-min(latitudes), max(longitudes)-min(longitudes))/8
 
         # 分别计算经度和纬度的标准差
         self.lat_std = np.std(latitudes)
@@ -48,7 +49,7 @@ class BCL_cluster:
         random.seed(seed_value)  # 根据输入的种子固定随机顺序
 
         random_arrays = []
-        for _ in range(10):  # 生成10个随机数组
+        for _ in range(100):  # 生成100个随机数组
             shuffled_array = original_array[:]  # 复制原始数组
             random.shuffle(shuffled_array)  # 随机打乱顺序
             random_arrays.append(shuffled_array)
@@ -76,7 +77,7 @@ class BCL_cluster:
 
             self.interation_count += 1
             print(self.interation_count)
-            if self.interation_count >= 10*len(self.customers):
+            if self.interation_count >= 100*len(self.customers):
                 self.terminate = 1
 
             # 计算客户与每个簇中心的距离
@@ -243,25 +244,27 @@ def generate_gaussian_cus_data(num_customers, num_clusters):
 
     return cus_data
 
+def main():
 
-# 生成20个客户，分布在3个聚类中
-num_customers = 300
-num_clusters = 16
-cus_data = generate_gaussian_cus_data(num_customers, num_clusters)
+    # 生成20个客户，分布在3个聚类中
+    num_customers = 300
+    num_clusters = 16
+    cus_data = generate_gaussian_cus_data(num_customers, num_clusters)
 
-for i in range(10):
-    BCL_test = BCL_cluster(cus_data)
-    BCL_test.clustering()
+    for i in range(10):
+        BCL_test = BCL_cluster(cus_data)
+        BCL_test.clustering()
 
-    print(f"纬度标准差: {BCL_test.lat_std}")
-    print(f"经度标准差: {BCL_test.lon_std}")
+        print(f"纬度标准差: {BCL_test.lat_std}")
+        print(f"经度标准差: {BCL_test.lon_std}")
 
-    # 绘制客户的经纬度散点图
-    BCL_test.plot_customers()
+        # 绘制客户的经纬度散点图
+        BCL_test.plot_customers()
 
-print('--------------------------test finished----------------------------')
+    print('--------------------------test finished----------------------------')
 
-
+if __name__ == '__main__':
+    main()
 
 
 
