@@ -8,7 +8,7 @@ import random  # 需要导入 random 库
 from sympy.stats.sampling.sample_numpy import numpy
 
 
-class BCL_cluster:
+class BCL_Cluster:
     '''
     cus_data 是 客户的经纬度数组 ： [('cus_name',latitude,longitude),...]
     '''
@@ -252,7 +252,7 @@ def main():
     cus_data = generate_gaussian_cus_data(num_customers, num_clusters)
 
     for i in range(10):
-        BCL_test = BCL_cluster(cus_data)
+        BCL_test = BCL_Cluster(cus_data)
         BCL_test.clustering()
 
         print(f"纬度标准差: {BCL_test.lat_std}")
