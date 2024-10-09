@@ -3,10 +3,11 @@ from datetime import datetime
 from bcl import BCL_Cluster
 import math
 from itertools import combinations
+import matplotlib.pyplot as plt
 
 
 class Route(object):
-    def __init__(self, depot, init_customer, distance_dic, travelTime_dic):
+    def __init__(self, depot, init_customer, distance_dic, travelTime_dic, vehicle_info):
         self.distance_dic = distance_dic
         self.travelTime_dic = travelTime_dic
         self.depot = depot
@@ -14,10 +15,13 @@ class Route(object):
         self.init_customer['arrive_time'] = 0 + self.travelTime_dic[(depot['Depot_0']['name'],init_customer['name'] )]
         self.init_customer['end_time'] = self.init_customer['arrive_time'] + self.init_customer['service_time']
         # 以下生成回程的初始路径 后续需要根据具体的问题类型进行修改
-        self.route = [self.depot['Depot_0'], init_customer, self.depot['Depot_0']]
+        # self.route = [self.depot['Depot_0'], init_customer]  # 这里初始化非回程路径
+        self.route = [self.depot['Depot_0'], init_customer, self.depot['Depot_0']]  #这里初始化回程路径
         self.arrival_times = []
         self.travel_and_update_times()
+        self.capacity_volume = vehicle_info['asset_capacity_quantity']
         print('debug')
+
 
     def insert_customer(self, customer, position):
         # 在路径的 position 位置 插上 customer
@@ -26,6 +30,8 @@ class Route(object):
         if not feasible:
             raise Exception("插入后路线不可行")
 
+
+    # 每次更新的计算复杂度是 n
     def travel_and_update_times(self):
         current_time = 0
         arrival_times = []
@@ -65,26 +71,26 @@ class Route(object):
 
 
 class HeuristicInitial:
-    def __init__(self, depot, shipments, distance_dic, travelTime_dic):
+    def __init__(self, depot, shipments, distance_dic, travelTime_dic, vehicle_info):
         self.depot = depot
         self.shipments = shipments
         self.cus_inallocated = list(shipments.keys())
         self.cus_allocated = []
         self.distance_dic = distance_dic
         self.travelTime_dic = travelTime_dic
+        self.vehicle_info = vehicle_info
         self.routes = []
 
         # 以下是在实例化 BCL 以方便后续聚类调用
         pass_shipments = {key: shipment['location'] for key, shipment in shipments.items()}
         self.BCL = BCL_Cluster(pass_shipments)
         # BCL聚类 以及 链表后处理
-        self.BCL.clustering()
-        self.BCL.plot_customers()
+        # self.BCL.clustering()
+        # self.BCL.plot_customers()
         self.cluster_members = {cluster_center:info['mem'] for cluster_center,info in self.BCL.cluster_centers.items()}
         # cluster_members = {clus_0:[cus_1, cus_2 ···], ···}
         self.cus_cluster_dic = {mem: cluster for cluster, members in self.cluster_members.items() for mem in members}
         # cus_cluster_dic = {cus_1:clus_0, cus_2:clus_0, ···}
-
 
         # 将时间窗口转换为从参考时间开始的小时数
         reference_time = datetime(2018, 6, 10, 0, 0)
@@ -110,31 +116,42 @@ class HeuristicInitial:
         distance_prev_next = self.distance_dic[(prev_customer['name'], next_customer['name'])]
         additional_distance = distance_prev_new + distance_new_next - distance_prev_next
 
-        # 检查时间窗口的可行性
+        # 检查可行性
         temp_route = route.route[:position] + [customer] + route.route[position:]
-        feasible, arrival_times = self.check_time_windows(temp_route)
+        feasible, arrival_times = self.check_and_update(temp_route,route)
         if feasible:
             return additional_distance, True
         else:
             return None, False
 
 
-    def check_time_windows(self, temp_route):
+    # 检查新路径是否可行 计算复杂度为 n
+    def check_and_update(self, temp_route, route):
         current_time = 0  # 从仓库开始，时间为零
+        total_demand = 0  # 累加客户需求量
         arrival_times = []
         for i in range(1, len(temp_route)):
             prev_customer = temp_route[i - 1]
             customer = temp_route[i]
 
+            # 累加需求量
+            total_demand += customer.get('demand', 0)
+
+            # 检查容量限制
+            if total_demand > route.capacity_volume:
+                return False, None  # 超过容量限制
+
+            # 计算旅行时间
             travel_time = self.travelTime_dic[(prev_customer['name'], customer['name'])]
             arrival_time = current_time + travel_time
 
             # 执行时间窗口限制
-            tw_start, tw_end = customer.get('time_window', (None, None))
+            tw_start, tw_end = customer.get('time_window', (0, float('inf')))
             if arrival_time < tw_start:
                 arrival_time = tw_start  # 等待时间窗口打开
             if arrival_time > tw_end:
                 return False, None  # 时间窗口违反
+
 
             # 添加服务时间
             service_time = customer.get('service_time', 0)
@@ -155,10 +172,11 @@ class HeuristicInitial:
                 self.cus_inallocated,
                 key=lambda cid: self.distance_dic[(depot_name, self.shipments[cid]['name'])]
             )
+
             init_customer = self.shipments[closest_customer_id]
 
             # 创建一个包含该客户的新路线
-            new_route = Route(self.depot, init_customer, self.distance_dic, self.travelTime_dic)
+            new_route = Route(self.depot, init_customer, self.distance_dic, self.travelTime_dic, self.vehicle_info)
             self.routes.append(new_route)
             self.cus_inallocated.remove(closest_customer_id)
             self.cus_allocated.append(closest_customer_id)
@@ -169,32 +187,90 @@ class HeuristicInitial:
                 best_insertion = None
                 min_cost_increase = float('inf')
 
-            for customer_id in self.cus_inallocated:
-                customer = self.shipments[customer_id]
-                for position in range(1, len(new_route.route)):
-                    # 目前是只写了距离的最廉价插入
-                    cost_increase, feasible = self.calculate_insertion_cost(new_route, customer, position)
-                    if feasible and cost_increase < min_cost_increase:
-                        min_cost_increase = cost_increase
-                        best_insertion = (customer_id, position)
+                for customer_id in self.cus_inallocated:
+                    customer = self.shipments[customer_id]
+                    for position in range(1, len(new_route.route)):
+                        # 目前是只写了距离的最廉价插入
+                        cost_increase, feasible = self.calculate_insertion_cost(new_route, customer, position)
+                        if feasible and cost_increase < min_cost_increase:
+                            min_cost_increase = cost_increase
+                            best_insertion = (customer_id, position)
 
-            if best_insertion:
-                # 将客户插入最佳位置
-                customer_id, position = best_insertion
-                customer = self.shipments[customer_id]
-                new_route.insert_customer(customer, position)
-                self.cus_inallocated.remove(customer_id)
-                self.cus_allocated.append(customer_id)
-            else:
-                # 未找到可行的插入，转到下一条路线
-                route_feasible = False
+                if best_insertion:
+                    # 将客户插入最佳位置
+                    customer_id, position = best_insertion
+                    customer = self.shipments[customer_id]
+                    new_route.insert_customer(customer, position)
+                    self.cus_inallocated.remove(customer_id)
+                    self.cus_allocated.append(customer_id)
+                else:
+                    # 未找到可行的插入，转到下一条路线
+                    route_feasible = False
 
+    def calculate_total_cost(self):
+        total_cost = 0
 
+        for route in self.routes:
+            # 获取当前车辆的固定成本和每单位距离的行驶费用
+            vehicle_info = self.vehicle_info
+            fixed_cost = vehicle_info['fixed_cost']
+            unit_distance_cost = vehicle_info['unit_distance_cost']
 
-        print("debug")
+            # 计算每条路线的行驶距离
+            route_distance = 0
+            for i in range(1, len(route.route)):
+                prev_customer = route.route[i - 1]
+                customer = route.route[i]
+                route_distance += self.distance_dic[(prev_customer['name'], customer['name'])]
+
+            # 当前路径的总成本 = 固定成本 + 路线距离 * 每单位距离费用
+            route_cost = fixed_cost + route_distance * unit_distance_cost
+            total_cost += route_cost
+
+            # 打印每条路径的总成本
+            print(f"Route {self.routes.index(route) + 1} cost: {route_cost}")
+
+        # 打印所有路径的总成本
+        print(f"Total cost for all routes: {total_cost}")
+        return total_cost
 
 
 # -----------------------------------------以下是调试代码-------------------------------------------------
+
+# 绘制路径函数
+def plot_routes(routes, depot):
+    plt.figure(figsize=(10, 8))
+
+    # 定义颜色列表，不同路径用不同颜色
+    colors = plt.cm.get_cmap('tab10', len(routes))
+
+    # 绘制每一条路径
+    for idx, route_single in enumerate(routes, start=1):
+        # 获取路径中每个点的坐标
+        route_coords = [customer['location'] for customer in route_single.route]
+
+        # 将坐标拆分为经度和纬度列表
+        x_coords, y_coords = zip(*route_coords)
+
+        # 使用不同的颜色绘制路径
+        plt.plot(x_coords, y_coords, '-o', color=colors(idx-1), label=f"Route {idx}")
+
+    # 标记仓库位置
+    depot_coords = depot['Depot_0']['location']
+    plt.scatter(*depot_coords, color='red', label='Depot', s=100)
+
+    # 显示图例
+    plt.legend()
+
+    # 添加标签和标题
+    plt.title("Routes Visualization")
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.grid(True)
+
+    # 显示图形
+    plt.show()
+
 # 随机生成 分簇客户 以及 客户对应时间窗口的函数
 def generate_gaussian_cus_data(num_customers, num_clusters):
     cus_data = {}
@@ -264,6 +340,7 @@ shipments = {
     'Customer_1': {
         'name': '66cc60f08d7695021861a519-1',
         'location': (42.83300437, -108.7325985),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -273,6 +350,7 @@ shipments = {
     'Customer_2': {
         'name': '66cc60f08d7695021861a529-2',
         'location': (44.52321128, -109.0571007),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -282,6 +360,7 @@ shipments = {
     'Customer_3': {
         'name': '66cc60f08d7695021861a49f-3',
         'location': (33.53997988, -112.0699917),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -291,6 +370,7 @@ shipments = {
     'Customer_4': {
         'name': '66cc60f08d7695021861a491-4',
         'location': (35.18987917, -114.0522221),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -300,6 +380,7 @@ shipments = {
     'Customer_5': {
         'name': '66cc60f08d7695021861a457-5',
         'location': (40.03844627, -105.246093),
+        'demand': 110.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -309,6 +390,7 @@ shipments = {
     'Customer_6': {
         'name': '66cc60f08d7695021861a489-6',
         'location': (32.95037762, -112.7246546),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -318,6 +400,7 @@ shipments = {
     'Customer_7': {
         'name': '66cc60f08d7695021861a459-7',
         'location': (39.09385276, -108.5499998),
+        'demand': 110.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -327,6 +410,7 @@ shipments = {
     'Customer_8': {
         'name': '66cc60f08d7695021861a51b-8',
         'location': (44.75867495, -108.7584367),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -336,6 +420,7 @@ shipments = {
     'Customer_9': {
         'name': '66cc60f08d7695021861a511-9',
         'location': (41.86750775, -103.6606859),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -345,6 +430,7 @@ shipments = {
     'Customer_10': {
         'name': '66cc60f08d7695021861a449-10',
         'location': (38.2803882, -104.6300066),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -354,6 +440,7 @@ shipments = {
     'Customer_11': {
         'name': '66cc60f08d7695021861a513-11',
         'location': (42.82791424, -103.0030774),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -363,6 +450,7 @@ shipments = {
     'Customer_12': {
         'name': '66cc60f08d7695021861a49b-12',
         'location': (35.19809572, -111.6505083),
+        'demand': 40.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -372,6 +460,7 @@ shipments = {
     'Customer_13': {
         'name': '66cc60f08d7695021861a49d-13',
         'location': (32.20499676, -110.8899862),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -381,6 +470,7 @@ shipments = {
     'Customer_14': {
         'name': '66cc60f08d7695021861a4d5-14',
         'location': (39.59979087, -110.8100169),
+        'demand': 40.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -390,6 +480,7 @@ shipments = {
     'Customer_15': {
         'name': '66cc60f08d7695021861a4d7-15',
         'location': (37.67742759, -113.061094),
+        'demand': 60.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -399,6 +490,7 @@ shipments = {
     'Customer_16': {
         'name': '66cc60f08d7695021861a47b-16',
         'location': (33.58194114, -112.1958238),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -408,6 +500,7 @@ shipments = {
     'Customer_17': {
         'name': '66cc60f08d7695021861a50b-17',
         'location': (42.02871238, -97.43359827),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -417,6 +510,7 @@ shipments = {
     'Customer_18': {
         'name': '66cc60f08d7695021861a52d-18',
         'location': (41.14000694, -104.8197107),
+        'demand': 60.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -426,6 +520,7 @@ shipments = {
     'Customer_19': {
         'name': '66cc60f08d7695021861a4cf-19',
         'location': (37.04738853, -112.5254936),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -435,6 +530,7 @@ shipments = {
     'Customer_20': {
         'name': '66cc60f08d7695021861a485-20',
         'location': (35.14817629, -114.5674878),
+        'demand': 60.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -444,6 +540,7 @@ shipments = {
     'Customer_21': {
         'name': '66cc60f08d7695021861a4c9-21',
         'location': (39.71027508, -111.8354841),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -453,6 +550,7 @@ shipments = {
     'Customer_22': {
         'name': '66cc60f08d7695021861a517-22',
         'location': (41.24000083, -96.00999007),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -462,6 +560,7 @@ shipments = {
     'Customer_23': {
         'name': '66cc60f08d7695021861a4cd-23',
         'location': (37.84253379, -112.8272065),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -471,6 +570,7 @@ shipments = {
     'Customer_24': {
         'name': '66cc60f08d7695021861a52b-24',
         'location': (42.86661989, -106.3124878),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 10, 16, 0),
@@ -480,6 +580,7 @@ shipments = {
     'Customer_25': {
         'name': '66cc60f08d7695021861a515-25',
         'location': (40.81997479, -96.68000086),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -489,6 +590,7 @@ shipments = {
     'Customer_26': {
         'name': '66cc60f08d7695021861a4d9-26',
         'location': (40.45539756, -109.5280022),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -498,6 +600,7 @@ shipments = {
     'Customer_27': {
         'name': '66cc60f08d7695021861a4e1-27',
         'location': (40.7750163, -111.9300519),
+        'demand': 40.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 10, 16, 0),
@@ -507,6 +610,7 @@ shipments = {
     'Customer_28': {
         'name': '66cc60f08d7695021861a499-28',
         'location': (31.35864016, -109.5483627),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -516,6 +620,7 @@ shipments = {
     'Customer_29': {
         'name': '66cc60f08d7695021861a44f-29',
         'location': (38.54476483, -106.92829),
+        'demand': 150.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -525,6 +630,7 @@ shipments = {
     'Customer_30': {
         'name': '66cc60f08d7695021861a4c7-30',
         'location': (38.77247703, -112.0832984),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -534,6 +640,7 @@ shipments = {
     'Customer_31': {
         'name': '66cc60f08d7695021861a495-31',
         'location': (32.68527753, -114.6236084),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -543,6 +650,7 @@ shipments = {
     'Customer_32': {
         'name': '66cc60f08d7695021861a503-32',
         'location': (40.70070559, -99.08114628),
+        'demand': 40.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -552,6 +660,7 @@ shipments = {
     'Customer_33': {
         'name': '66cc60f08d7695021861a493-33',
         'location': (36.05478762, -112.1385922),
+        'demand': 40.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -561,6 +670,7 @@ shipments = {
     'Customer_34': {
         'name': '66cc60f08d7695021861a4db-34',
         'location': (41.23237856, -111.9680341),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -570,6 +680,7 @@ shipments = {
     'Customer_35': {
         'name': '66cc60f08d7695021861a497-35',
         'location': (34.59001914, -112.4477723),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -579,6 +690,7 @@ shipments = {
     'Customer_36': {
         'name': '66cc60f08d7695021861a443-36',
         'location': (39.69585736, -104.808497),
+        'demand': 60.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -588,6 +700,7 @@ shipments = {
     'Customer_37': {
         'name': '66cc60f08d7695021861a521-37',
         'location': (43.02816042, -108.3950481),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -597,6 +710,7 @@ shipments = {
     'Customer_38': {
         'name': '66cc60f08d7695021861a4dd-38',
         'location': (37.10415509, -113.583336),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -606,6 +720,7 @@ shipments = {
     'Customer_39': {
         'name': '66cc60f08d7695021861a525-39',
         'location': (44.28317425, -105.5052503),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -615,6 +730,7 @@ shipments = {
     'Customer_40': {
         'name': '66cc60f08d7695021861a50f-40',
         'location': (41.13980023, -102.9782727),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 10, 16, 0),
@@ -624,6 +740,7 @@ shipments = {
     'Customer_41': {
         'name': '66cc60f08d7695021861a51d-41',
         'location': (41.51455772, -109.4649827),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 10, 16, 0),
@@ -633,6 +750,7 @@ shipments = {
     'Customer_42': {
         'name': '66cc60f08d7695021861a507-42',
         'location': (42.10139528, -102.8701915),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -642,6 +760,7 @@ shipments = {
     'Customer_43': {
         'name': '66cc60f08d7695021861a447-43',
         'location': (40.56068829, -105.0588693),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 10, 16, 0),
@@ -651,6 +770,7 @@ shipments = {
     'Customer_44': {
         'name': '66cc60f08d7695021861a48b-44',
         'location': (31.71314048, -110.066884),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -660,6 +780,7 @@ shipments = {
     'Customer_45': {
         'name': '66cc60f08d7695021861a455-45',
         'location': (40.51728009, -107.5503968),
+        'demand': 110.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -669,6 +790,7 @@ shipments = {
     'Customer_46': {
         'name': '66cc60f08d7695021861a483-46',
         'location': (34.49829348, -114.3082789),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -678,6 +800,7 @@ shipments = {
     'Customer_47': {
         'name': '66cc60f08d7695021861a44b-47',
         'location': (38.08649823, -102.6194058),
+        'demand': 150.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -687,6 +810,7 @@ shipments = {
     'Customer_48': {
         'name': '66cc60f08d7695021861a445-48',
         'location': (40.41919822, -104.739974),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -696,6 +820,7 @@ shipments = {
     'Customer_49': {
         'name': '66cc60f08d7695021861a45b-49',
         'location': (38.86296246, -104.7919863),
+        'demand': 120.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -705,6 +830,7 @@ shipments = {
     'Customer_50': {
         'name': '66cc60f08d7695021861a4d3-50',
         'location': (38.57370363, -109.5491895),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -714,6 +840,7 @@ shipments = {
     'Customer_51': {
         'name': '66cc60f08d7695021861a441-51',
         'location': (39.54658999, -107.3247),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -723,6 +850,7 @@ shipments = {
     'Customer_52': {
         'name': '66cc60f08d7695021861a453-52',
         'location': (38.47727541, -107.8655197),
+        'demand': 120.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -732,6 +860,7 @@ shipments = {
     'Customer_53': {
         'name': '66cc60f08d7695021861a44d-53',
         'location': (37.17133445, -104.5063965),
+        'demand': 150.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -741,6 +870,7 @@ shipments = {
     'Customer_54': {
         'name': '66cc60f08d7695021861a48d-54',
         'location': (32.25321088, -109.8313945),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -750,6 +880,7 @@ shipments = {
     'Customer_55': {
         'name': '66cc60f08d7695021861a4df-55',
         'location': (40.24889854, -111.63777),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -759,6 +890,7 @@ shipments = {
     'Customer_56': {
         'name': '66cc60f08d7695021861a48f-56',
         'location': (33.69234784, -111.8680402),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -768,6 +900,7 @@ shipments = {
     'Customer_57': {
         'name': '66cc60f08d7695021861a487-57',
         'location': (35.28470542, -110.7006954),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -777,6 +910,7 @@ shipments = {
     'Customer_58': {
         'name': '66cc60f08d7695021861a47d-58',
         'location': (32.83382143, -109.7068801),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -786,6 +920,7 @@ shipments = {
     'Customer_59': {
         'name': '66cc60f08d7695021861a4d1-59',
         'location': (37.87178265, -109.3421995),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -795,6 +930,7 @@ shipments = {
     'Customer_60': {
         'name': '66cc60f08d7695021861a451-60',
         'location': (37.27564333, -107.8799891),
+        'demand': 120.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 10, 16, 0),
@@ -804,6 +940,7 @@ shipments = {
     'Customer_61': {
         'name': '66cc60f08d7695021861a45d-61',
         'location': (39.73918805, -104.984016),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -813,6 +950,7 @@ shipments = {
     'Customer_62': {
         'name': '66cc60f08d7695021861a481-62',
         'location': (33.42391461, -111.7360844),
+        'demand': 40.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 10, 16, 0),
@@ -822,6 +960,7 @@ shipments = {
     'Customer_63': {
         'name': '66cc60f08d7695021861a505-63',
         'location': (40.92226829, -98.35798629),
+        'demand': 40.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -831,6 +970,7 @@ shipments = {
     'Customer_64': {
         'name': '66cc60f08d7695021861a51f-64',
         'location': (41.7906649, -107.234292),
+        'demand': 70.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 13, 16, 0),
@@ -840,6 +980,7 @@ shipments = {
     'Customer_65': {
         'name': '66cc60f08d7695021861a47f-65',
         'location': (32.87937421, -111.7566258),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -849,6 +990,7 @@ shipments = {
     'Customer_66': {
         'name': '66cc60f08d7695021861a523-66',
         'location': (43.64597801, -108.2146715),
+        'demand': 40.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 14, 16, 0),
@@ -858,6 +1000,7 @@ shipments = {
     'Customer_67': {
         'name': '66cc60f08d7695021861a509-67',
         'location': (40.20559369, -100.6261683),
+        'demand': 90.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -867,6 +1010,7 @@ shipments = {
     'Customer_68': {
         'name': '66cc60f08d7695021861a4cb-68',
         'location': (41.73593955, -111.8335979),
+        'demand': 50.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -876,6 +1020,7 @@ shipments = {
     'Customer_69': {
         'name': '66cc60f08d7695021861a50d-69',
         'location': (41.13628623, -100.7705005),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 11, 16, 0),
@@ -885,6 +1030,7 @@ shipments = {
     'Customer_70': {
         'name': '66cc60f08d7695021861a527-70',
         'location': (41.31136599, -105.5905681),
+        'demand': 30.0,
         'service_time': 0,
         'time_window': (
             datetime(2018, 6, 12, 16, 0),
@@ -896,7 +1042,7 @@ shipments = {
 # 生成距离字典 {(出发地，目的地): 距离 ···} 以及 运输时间字典{(出发地，目的地): 占用运输时间 ···}
 distance_dic = {}
 asset_speed = 55.0
-vehicle_info = {'66cc60f08d7695021861a53a': {'asset_number': 100, 'asset_capacity_quantity': 500.0, 'asset_capacity_weight': 120000, 'asset_capacity_volume': 1000, 'asset_speed': 55.0, 'fixed_cost': 0, 'unit_distance_cost': 1.2},
+vehicles_info = {'66cc60f08d7695021861a53a': {'asset_number': 100, 'asset_capacity_quantity': 500.0, 'asset_capacity_weight': 120000, 'asset_capacity_volume': 1000, 'asset_speed': 55.0, 'fixed_cost': 0, 'unit_distance_cost': 1.2},
                 '66cc60f08d7695021861a53c': {'asset_number': 100, 'asset_capacity_quantity': 200.0, 'asset_capacity_weight': 120000, 'asset_capacity_volume': 1000, 'asset_speed': 55.0, 'fixed_cost': 0, 'unit_distance_cost': 2.4}}
 travelTime_dic = {}
 
@@ -919,5 +1065,17 @@ for (key1, data1), (key2, data2) in combinations(locations.items(), 2):
     distance_dic[(name2, name1)] = distance
     travelTime_dic[(name2, name1)] = travel_time
 
-heuristicInitial = HeuristicInitial(depot, shipments, distance_dic, travelTime_dic)
+heuristicInitial = HeuristicInitial(depot, shipments, distance_dic, travelTime_dic, vehicles_info['66cc60f08d7695021861a53a'])
 heuristicInitial.search_initial_feasible()
+# 遍历每条路线
+for idx, route_single in enumerate(heuristicInitial.routes, start=1):
+    # 提取路线中的站点名称
+    route_nodes = [customer['name'] for customer in route_single.route]
+    # 打印路线编号和经过的站点
+    print(f"Route {idx}: {route_nodes}")
+
+# 调用绘图函数，显示所有路径
+plot_routes(heuristicInitial.routes, depot)
+
+# 计算并输出总成本
+total_cost = heuristicInitial.calculate_total_cost()
