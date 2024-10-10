@@ -4,19 +4,22 @@ from bcl import BCL_Cluster
 import math
 from itertools import combinations
 import matplotlib.pyplot as plt
+from scipy.spatial import KDTree
 
 
 class Route(object):
-    def __init__(self, depot, init_customer, distance_dic, travelTime_dic, vehicle_info):
+    def __init__(self, depot, init_customer, distance_dic, travelTime_dic, vehicle_info, is_round):
         self.distance_dic = distance_dic
         self.travelTime_dic = travelTime_dic
         self.depot = depot
         self.init_customer = init_customer
         self.init_customer['arrive_time'] = 0 + self.travelTime_dic[(depot['Depot_0']['name'],init_customer['name'] )]
         self.init_customer['end_time'] = self.init_customer['arrive_time'] + self.init_customer['service_time']
-        # 以下生成回程的初始路径 后续需要根据具体的问题类型进行修改
-        # self.route = [self.depot['Depot_0'], init_customer]  # 这里初始化非回程路径
-        self.route = [self.depot['Depot_0'], init_customer, self.depot['Depot_0']]  #这里初始化回程路径
+        self.is_round = is_round
+        if is_round:
+            self.route = [self.depot['Depot_0'], init_customer, self.depot['Depot_0']]  #这里初始化回程路径
+        else:
+            self.route = [self.depot['Depot_0'], init_customer]  # 这里初始化非回程路径
         self.arrival_times = []
         self.travel_and_update_times()
         self.capacity_volume = vehicle_info['asset_capacity_quantity']
@@ -57,17 +60,18 @@ class Route(object):
             current_time = service_start_time + service_time
             service_end_time = current_time
             arrival_times.append(arrival_time)
-            service_times.append((service_start_time,service_end_time))
+            service_times.append((service_start_time, service_end_time))
 
             # 更新客户的到达和结束时间
             customer['arrive_time'] = arrival_time
             customer['end_time'] = current_time
             customer['service_period'] = (service_start_time, service_end_time)
 
+        # 对于非回程路线，可能需要在此添加对总行程时间或其他限制的检查
+        # 如果有最大行驶时间限制，需要在此处检查 current_time 是否超过限制
+
         self.arrival_times = arrival_times
         return True, arrival_times
-
-
 
 
 class HeuristicInitial:
@@ -80,16 +84,27 @@ class HeuristicInitial:
         self.travelTime_dic = travelTime_dic
         self.vehicle_info = vehicle_info
         self.routes = []
+        self.is_round = vehicle_info['is_round']
+
+        # 获取仓库位置
+        depot_location = self.depot['Depot_0']['location']
+
+        # 计算所有客户与仓库的距离，并按距离从小到大排序
+        self.sorted_customers = sorted(
+            self.cus_inallocated,
+            key=lambda cid: self.distance_dic[(depot['Depot_0']['name'], shipments[cid]['name'])]
+        )
+
 
         # 以下是在实例化 BCL 以方便后续聚类调用
-        pass_shipments = {key: shipment['location'] for key, shipment in shipments.items()}
-        self.BCL = BCL_Cluster(pass_shipments)
+        # pass_shipments = {key: shipment['location'] for key, shipment in shipments.items()}
+        # self.BCL = BCL_Cluster(pass_shipments)
         # BCL聚类 以及 链表后处理
         # self.BCL.clustering()
         # self.BCL.plot_customers()
-        self.cluster_members = {cluster_center:info['mem'] for cluster_center,info in self.BCL.cluster_centers.items()}
+        # self.cluster_members = {cluster_center:info['mem'] for cluster_center,info in self.BCL.cluster_centers.items()}
         # cluster_members = {clus_0:[cus_1, cus_2 ···], ···}
-        self.cus_cluster_dic = {mem: cluster for cluster, members in self.cluster_members.items() for mem in members}
+        # self.cus_cluster_dic = {mem: cluster for cluster, members in self.cluster_members.items() for mem in members}
         # cus_cluster_dic = {cus_1:clus_0, cus_2:clus_0, ···}
 
         # 将时间窗口转换为从参考时间开始的小时数
@@ -106,23 +121,26 @@ class HeuristicInitial:
             shipment['service_time'] = shipment.get('service_time', 0) / 60  # 如果需要，将分钟转换为小时
 
     def calculate_insertion_cost(self, route, customer, position):
-        # 获取路线中前一个和后一个客户
         prev_customer = route.route[position - 1]
-        next_customer = route.route[position]
-
-        # 计算成本差异
-        distance_prev_new = self.distance_dic[(prev_customer['name'], customer['name'])]
-        distance_new_next = self.distance_dic[(customer['name'], next_customer['name'])]
-        distance_prev_next = self.distance_dic[(prev_customer['name'], next_customer['name'])]
-        additional_distance = distance_prev_new + distance_new_next - distance_prev_next
-
-        # 检查可行性
-        temp_route = route.route[:position] + [customer] + route.route[position:]
-        feasible, arrival_times = self.check_and_update(temp_route,route)
-        if feasible:
-            return additional_distance, True
+        # 检查是否有下一个客户
+        if position < len(route.route):
+            next_customer = route.route[position]
+            distance_prev_new = self.distance_dic[(prev_customer['name'], customer['name'])]
+            distance_new_next = self.distance_dic[(customer['name'], next_customer['name'])]
+            distance_prev_next = self.distance_dic[(prev_customer['name'], next_customer['name'])]
+            additional_distance = distance_prev_new + distance_new_next - distance_prev_next
         else:
-            return None, False
+            # 插入到路线末尾，没有下一个客户
+            distance_prev_new = self.distance_dic[(prev_customer['name'], customer['name'])]
+            additional_distance = distance_prev_new
+
+        # 检查可行性并计算等待时间
+        temp_route = route.route[:position] + [customer] + route.route[position:]
+        feasible, arrival_times, waiting_time = self.check_and_update(temp_route, route)
+        if feasible:
+            return additional_distance, waiting_time, True
+        else:
+            return None, None, False
 
 
     # 检查新路径是否可行 计算复杂度为 n
@@ -130,6 +148,7 @@ class HeuristicInitial:
         current_time = 0  # 从仓库开始，时间为零
         total_demand = 0  # 累加客户需求量
         arrival_times = []
+        total_waiting_time = 0  # 累计等待时间
         for i in range(1, len(temp_route)):
             prev_customer = temp_route[i - 1]
             customer = temp_route[i]
@@ -139,7 +158,7 @@ class HeuristicInitial:
 
             # 检查容量限制
             if total_demand > route.capacity_volume:
-                return False, None  # 超过容量限制
+                return False, None, None  # 超过容量限制
 
             # 计算旅行时间
             travel_time = self.travelTime_dic[(prev_customer['name'], customer['name'])]
@@ -148,10 +167,14 @@ class HeuristicInitial:
             # 执行时间窗口限制
             tw_start, tw_end = customer.get('time_window', (0, float('inf')))
             if arrival_time < tw_start:
+                waiting_time = tw_start - arrival_time  # 需要等待
                 arrival_time = tw_start  # 等待时间窗口打开
-            if arrival_time > tw_end:
-                return False, None  # 时间窗口违反
+                total_waiting_time += waiting_time  # 累计等待时间
+            else:
+                waiting_time = 0  # 不需要等待
 
+            if arrival_time > tw_end:
+                return False, None, None  # 时间窗口违反
 
             # 添加服务时间
             service_time = customer.get('service_time', 0)
@@ -159,49 +182,73 @@ class HeuristicInitial:
             arrival_times.append(arrival_time)
 
         # 如果需要，检查返回仓库
-        return True, arrival_times
-
+        return True, arrival_times, total_waiting_time
 
     def search_initial_feasible(self):
-        while self.cus_inallocated:
-            # 开始一条新路线
-            depot_name = self.depot['Depot_0']['name']
-
-            # 找到离仓库最近的未分配客户
-            closest_customer_id = min(
-                self.cus_inallocated,
-                key=lambda cid: self.distance_dic[(depot_name, self.shipments[cid]['name'])]
-            )
-
+        while self.sorted_customers:
+            # 取最近的客户
+            closest_customer_id = self.sorted_customers.pop(0)
             init_customer = self.shipments[closest_customer_id]
 
             # 创建一个包含该客户的新路线
-            new_route = Route(self.depot, init_customer, self.distance_dic, self.travelTime_dic, self.vehicle_info)
+            new_route = Route(self.depot, init_customer, self.distance_dic, self.travelTime_dic, self.vehicle_info,
+                              self.is_round)
             self.routes.append(new_route)
-            self.cus_inallocated.remove(closest_customer_id)
             self.cus_allocated.append(closest_customer_id)
 
             # 尝试将更多客户插入当前路线
-            route_feasible = True   # 保证路径不要违背时间窗的参数
-            while route_feasible and self.cus_inallocated:
-                best_insertion = None
-                min_cost_increase = float('inf')
-
-                for customer_id in self.cus_inallocated:
+            route_feasible = True  # 保证路径不要违背时间窗的参数
+            while route_feasible and self.sorted_customers:
+                insertion_options = []
+                for customer_id in self.sorted_customers:
                     customer = self.shipments[customer_id]
-                    for position in range(1, len(new_route.route)):
-                        # 目前是只写了距离的最廉价插入
-                        cost_increase, feasible = self.calculate_insertion_cost(new_route, customer, position)
-                        if feasible and cost_increase < min_cost_increase:
-                            min_cost_increase = cost_increase
-                            best_insertion = (customer_id, position)
 
-                if best_insertion:
+                    # 根据是否回程，确定插入位置的范围
+                    if self.is_round:
+                        insertion_positions = range(1, len(new_route.route))
+                    else:
+                        # 非回程路线，插入位置可以在路线的末尾
+                        insertion_positions = range(1, len(new_route.route) + 1)
+
+                    for position in insertion_positions:
+                        # 计算插入成本和等待时间
+                        cost_increase, waiting_time, feasible = self.calculate_insertion_cost(new_route, customer,
+                                                                                              position)
+                        if feasible:
+                            insertion_options.append({
+                                'customer_id': customer_id,
+                                'position': position,
+                                'cost_increase': cost_increase,
+                                'waiting_time': waiting_time
+                            })
+
+                if insertion_options:
+                    # 提取所有的cost_increase和waiting_time用于归一化
+                    cost_increases = [option['cost_increase'] for option in insertion_options]
+                    waiting_times = [option['waiting_time'] for option in insertion_options]
+
+                    # 归一化
+                    max_cost_increase = max(cost_increases) if max(cost_increases) != 0 else 1
+                    max_waiting_time = max(waiting_times) if max(waiting_times) != 0 else 1
+
+                    for option in insertion_options:
+                        # 归一化的成本和等待时间
+                        normalized_cost = option['cost_increase'] / max_cost_increase
+                        normalized_waiting = option['waiting_time'] / max_waiting_time
+
+                        # 计算综合成本
+                        total_cost = 1 * normalized_cost + 0.3 * normalized_waiting
+                        option['total_cost'] = total_cost
+
+                    # 找到综合成本最小的插入
+                    best_option = min(insertion_options, key=lambda x: x['total_cost'])
+
                     # 将客户插入最佳位置
-                    customer_id, position = best_insertion
+                    customer_id = best_option['customer_id']
+                    position = best_option['position']
                     customer = self.shipments[customer_id]
                     new_route.insert_customer(customer, position)
-                    self.cus_inallocated.remove(customer_id)
+                    self.sorted_customers.remove(customer_id)
                     self.cus_allocated.append(customer_id)
                 else:
                     # 未找到可行的插入，转到下一条路线
@@ -1042,8 +1089,8 @@ shipments = {
 # 生成距离字典 {(出发地，目的地): 距离 ···} 以及 运输时间字典{(出发地，目的地): 占用运输时间 ···}
 distance_dic = {}
 asset_speed = 55.0
-vehicles_info = {'66cc60f08d7695021861a53a': {'asset_number': 100, 'asset_capacity_quantity': 500.0, 'asset_capacity_weight': 120000, 'asset_capacity_volume': 1000, 'asset_speed': 55.0, 'fixed_cost': 0, 'unit_distance_cost': 1.2},
-                '66cc60f08d7695021861a53c': {'asset_number': 100, 'asset_capacity_quantity': 200.0, 'asset_capacity_weight': 120000, 'asset_capacity_volume': 1000, 'asset_speed': 55.0, 'fixed_cost': 0, 'unit_distance_cost': 2.4}}
+vehicles_info = {'66cc60f08d7695021861a53a': {'asset_number': 100, 'asset_capacity_quantity': 500.0, 'asset_capacity_weight': 120000, 'asset_capacity_volume': 1000, 'asset_speed': 55.0, 'fixed_cost': 0, 'unit_distance_cost': 1.2, 'is_round':False},
+                '66cc60f08d7695021861a53c': {'asset_number': 100, 'asset_capacity_quantity': 200.0, 'asset_capacity_weight': 120000, 'asset_capacity_volume': 1000, 'asset_speed': 55.0, 'fixed_cost': 0, 'unit_distance_cost': 2.4}, 'is_round':False}
 travelTime_dic = {}
 
 # 将所有站点（包括depot和shipments）合并
@@ -1066,7 +1113,19 @@ for (key1, data1), (key2, data2) in combinations(locations.items(), 2):
     travelTime_dic[(name2, name1)] = travel_time
 
 heuristicInitial = HeuristicInitial(depot, shipments, distance_dic, travelTime_dic, vehicles_info['66cc60f08d7695021861a53a'])
+
+# 记录开始时间
+start_time = datetime.now()
+
 heuristicInitial.search_initial_feasible()
+
+# 记录结束时间
+end_time = datetime.now()
+
+# 计算初始解生成所花费的时间
+elapsed_time = end_time - start_time
+print(f"Initial solution generated in: {elapsed_time}")
+
 # 遍历每条路线
 for idx, route_single in enumerate(heuristicInitial.routes, start=1):
     # 提取路线中的站点名称
